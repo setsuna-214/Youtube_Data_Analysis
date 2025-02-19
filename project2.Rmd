@@ -1,0 +1,794 @@
+---
+title: "project 2"
+author: "authorxxxxxxx"
+date: "2023-10-14"
+output:
+  html_document:
+    fig_show: asis
+    code_folding: show
+    toc: true
+    toc_float: true
+---
+
+In this analysis, GPT helped us gain some insight.
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(gridExtra)
+library(mice)
+library(tibble)
+library(tidyr)
+library(crayon)
+library(knitr)
+library(lattice)
+library(klaR)
+library(lime)
+library(ROCR)
+library(ROCit)
+library(rpart)
+library(rpart.plot)
+library(pander)
+library(recipes)
+library(e1071)
+library(xgboost)
+library(corrplot)
+library(fpc)
+library(caret)
+```
+
+###Data preparation
+```{r}
+gy_data <- read.csv("processed_Youtube_data.csv")
+
+# Create a new column 'earnings' based on the median
+gy_data$earnings <- ifelse(gy_data$lowest_yearly_earnings > 49430.3, 1, 0)
+
+# Count the number of 1 and 0 in 'earnings'
+count_earnings_1 <- sum(gy_data$earnings == 1)
+count_earnings_0 <-sum(gy_data$earnings == 0)
+count_earnings_1
+count_earnings_0
+```
+Load the dataset, and choose the highest monthly earnings as the target variable for classification.
+
+There are four categories of earnings in the dataset, and we choose lowest_yearly_earnings as the target variable for categorization. For reference, we use the 2022 high-income threshold, which stands at 49,430.3, from the World Bank's data in the following link, 'https://data.worldbank.org/income-level/high-income?year=2022'.
+
+Since our dataset primarily focuses on top-ranking YouTubers, there is very possible to skew towards higher video views and income levels. Consequently, using GDP per capita from the corresponding countries might lead to a situation where most of the data are high income. We plan to make necessary adjustments to address any data imbalances at a later stage.
+
+### 1. Feature Selection
+### 1.1 Correlation coefficient
+```{r}
+#Select the variables calculate the correlations.
+selected_columns <- gy_data[, c("Latitude", "Urban_population", "Unemployment.rate", "Population", "Gross.tertiary.education.enrollment....",
+      "lowest_yearly_earnings",
+      "video_views_for_the_last_30_days", "video.views")]
+
+# Calculate the correlation matrix
+correlation_matrix <- cor(selected_columns)
+
+# Make correlations plot
+corrplot(correlation_matrix, 
+         method = "number", 
+         type = "full",  
+         tl.col = "black", 
+         tl.srt = 45,      
+         addrect = 4,
+         number.cex = 0.7,
+         tl.cex = 0.7,
+         cl.cex = 0.7)    
+
+title("Correlation Plot of Variables")
+```
+We can see from the correlation coefficient plot that the "lowest_yearly_earnings" has the strongest correlation with "views for last 30 days" and "video views", registering coefficients of 0.69 and 0.63, respectively. Base on this, we choose these two factors as part of our variables for exploration in our study.
+
+### 1.2 Literature Review
+According to the research presented in the paper "Prestianta, A. M. (2021). Mapping the ASEAN YouTube uploaders. Jurnal ASPIKOM, 6(1), 1-12," there's a significant correlation between earnings and subscribers, the coefficient is 0.75. Therefore chosen "subscribers" and "subscribers_for_last_30_days" as feature variables to predict the youtuber's income level.
+
+Besides, the author of this paper also points out that certain countries has higher degree of internet addiction than others. So we hypothesize the population size of a country might also influence a youtuber's earnings. Therefore we choose "Population" and "Urban_population" as part of our feature variables.
+
+### 1.3 Set the classification data frame
+```{r}
+myvars <- c( "video.views", "video_views_for_the_last_30_days", "subscribers", "subscribers_for_last_30_days", "Population", "Urban_population", "earnings")
+df_to_classification <- gy_data[myvars]
+```
+
+```{r}
+df_to_classification$subscribers_for_last_30_days <- ifelse(df_to_classification$subscribers_for_last_30_days == "other", NA, df_to_classification$subscribers_for_last_30_days)
+df_to_classification$subscribers_for_last_30_days <- as.numeric(df_to_classification$subscribers_for_last_30_days)
+df_to_classification$video.views <- as.numeric(df_to_classification$video.views)
+df_to_classification$video_views_for_the_last_30_days <- as.numeric(df_to_classification$video_views_for_the_last_30_days)
+```
+Selecting the factors as variables, ensure the data is the correct type and deal with the irregular datas.
+
+### 1.4 Split the data set
+```{r}
+# set seeds
+set.seed(12345)
+intrain <- runif(nrow(df_to_classification)) < 0.80
+train <- df_to_classification[intrain,]
+test <- df_to_classification[!intrain,]
+
+# split the train set into training set and validation set
+pos <- 1
+outcome <- "earnings"
+useForVal <- rbinom(n=dim(train)[1], size=1, prob=0.1)>0
+dCal <- subset(train, useForVal)
+dTrain <- subset(train, !useForVal)
+useForVal <- rbinom(n=dim(train)[1], size=1, prob=0.1)>0
+validation <- subset(train, useForVal)
+train <- subset(train, !useForVal)
+
+cat("Training data set size:", dim(train))
+cat("Validation data set size:", dim(validation))
+cat("Test data set size:", dim(test))
+```
+Split the dataset into  training set, validation set and test set.
+
+### 2.Single-variate model
+### 2.1 Single-variate model selection
+```{r}
+PredC <- function(outColumn, varColumn, appColumn) {
+  pPos <- sum(outColumn == pos) / length(outColumn)
+  naTab <- table(outColumn[is.na(varColumn)])
+  pPosWna <- (naTab/sum(naTab))[pos]
+  vTab <- table(outColumn, varColumn)
+  pPosWv <- (vTab[pos,] + 1.0e-3 * pPos) / (colSums(vTab) + 1.0e-3)
+  pred <- pPosWv[appColumn]
+  pred[is.na(appColumn)] <- pPosWna
+  pred[is.na(pred)] <- pPos
+  pred
+}
+```
+The predictive variable is the lowest yearly earnings, which has been categorized into two groups: high and non-high earnings. Therefore, the predictive variable is category variable. We initially constructed a single categorical variable model to predict the outcomes. 
+
+```{r}
+earnsVars <- setdiff(myvars, 'earnings')
+
+for(v in earnsVars) {
+  p <- paste('pred_', v, sep = '')
+  train[, p] <- PredC(train[,outcome], train[, v], train[,v])
+  validation[, p] <- PredC(train[,outcome], train[, v], validation[,v])
+  test[, p] <- PredC(train[, outcome], train[,v], test[,v])
+}
+```
+
+```{r}
+
+calcAUC <- function(predCol, outCol) {
+  perf <- performance(prediction(predCol, outCol == pos), 'auc')
+  as.numeric(perf@y.values)
+}
+
+for (v in earnsVars) {
+  p <- paste('pred_', v, sep = '')
+  aucTrain <- calcAUC(train[, p], train[, outcome])
+  if (aucTrain >= 0.5) {
+    aucCal <- calcAUC(validation[,p], validation[,outcome])
+    print(sprintf(
+      "%s: trainAUC: %5.3f; validationAUC: %4.3f",
+      p, aucTrain, aucCal))
+  }
+}
+
+```
+We evaluated each univariate model using the AUC value. The training AUC for "subscribers_for_last_30_days", "pred_video_views_for_the_last_30_days", and "pred_highest_monthly_earnings" were inflated when compared to the AUC. For the other predictive variables, the values were consistent between training and validation.
+
+```{r}
+vars <- c("video.views", "video_views_for_the_last_30_days", "subscribers", "subscribers_for_last_30_days", "Population", "Urban_population")
+
+for (var in vars) {
+  aucs <- rep(0, 100)
+  for (rep in 1:length(aucs)) {
+    useForCalRep <- rbinom(n = nrow(train), size = 1, prob = 0.1)>0
+    predRep <- PredC(train[!useForCalRep, outcome],
+                     train[!useForCalRep, var],
+                     train[useForCalRep, var])
+    aucs[rep] <- calcAUC(predRep, train[useForCalRep, outcome])
+  }
+  print(sprintf("%s: mean: %5.3f; sd: %5.3f", var, mean(aucs), sd(aucs)))
+}
+```
+We then use the 100-fold cross-validation to inspect the AUC values of the other six predictive variables. If an AUC value is greater than 0.5 indicates that the model performs better than random guessing, while an AUC value below 0.5 suggests that the model's predictive performance is bad. 
+
+The results demonstrated that "subscribers_for_last_30_days" displayed a good performance in predicting earnings, better than the performance of random guessing. The performance of the other variables was the same as the random guessing or even worse than andom guessing.
+
+```{r}
+# Calculate and store AUC values for each single variable
+auc_values <- numeric(length = length(earnsVars))
+for (i in 1:length(earnsVars)) {
+  v <- earnsVars[i]
+  p <- paste('pred_', v, sep = '')
+  auc_values[i] <- calcAUC(test[, p], test[, outcome])
+}
+
+# Sort AUC values and corresponding variables
+top_four_indices <- tail(order(auc_values, decreasing = TRUE), 4)
+top_four_variables <- earnsVars[top_four_indices]
+
+# Set up a blank plot with appropriate axes and labels
+plot(NA, NA, xlim = c(0, 1), ylim = c(0, 1), xlab = "False Positive Rate", ylab = "True Positive Rate", main = "Combined ROC Curves")
+
+# Plot ROC curves for the top four variables
+library(ROCR) # Make sure you have ROCR package installed
+colors <- c("red", "green", "blue", "purple")
+for (i in 1:4) {
+  v <- top_four_variables[i]
+  p <- paste('pred_', v, sep = '')
+  perf <- performance(prediction(test[, p], test[, outcome] == pos), "tpr", "fpr")
+  plot(perf, col = colors[i], add = TRUE, lwd = 2, lty = i)
+  legend(0, 1, legend = top_four_variables, col = colors, lty = 1:4, title = "Variables", cex = 0.8)
+}
+```
+We want to plot the ROC curves for the top five single variables in terms of performance from the test set. The result of the plot shows the same result as the above analyses.
+
+The "subscribers_for_last_30_days" displayed a good performance in predicting earnings while the performance of the other variables was the same as the random guessing.
+
+### 2.2 Null model
+```{r}
+Npos <- sum(train[,outcome] == 1)
+pred.Null <- Npos / nrow(train)
+cat("Propotion of outcome equals to 1 in the training dataset:", pred.Null)
+```
+In the training dataset, the proportion of outcomes equal to 1 is 0.7240664, which approximately 72.4%.
+
+```{r}
+TP <- 0; TN <- sum(validation[, outcome] == 1); 
+FP <- 0; FN <- sum(validation[, outcome] == 0); 
+
+cat("nrow(validation):", nrow(validation), "TP:", TP, "TN:", TN, "FP:", FP, "FN:", FN)
+```
+The results indicate that the model predicted all observations to be positive cases. The counts for true positives and false positives are both 0, whereas the counts for true negatives and false negatives are 47 and 14, respectively.
+
+```{r}
+accuracy <- (TP + TN) / nrow(validation)
+cat(accuracy)
+
+precision <- TP/(TP + FP)
+cat(precision)
+
+recall <- TP/(TP + FN)
+cat(recall)
+
+pred.Null <- rep(pred.Null, nrow(validation))
+AUC <- calcAUC(pred.Null, validation[, outcome])
+```
+The accuracy indicates that the model has an approximate accuracy of 77.05% on the validation set. However, precision cannot be computed since the model did not predict any positive cases. The recall is also 0, the model failed to correctly identify any true positives.
+
+```{r}
+logLikelihood <- function(ytrue, ypred, epsilon = 1e-6) {
+  sum(ifelse(ytrue == pos, log(ypred + epsilon), log(1-ypred-epsilon)), na.rm = T)
+}
+
+logNull <- logLikelihood(train[,outcome], sum(train[,outcome]==pos)/nrow(train))
+cat(logNull)
+```
+Use the loglikelihood method to select feature, define a function to compute the loglikelihood for repeated use. And calculate the likelihood of the Null model on the training set. A greater likelihood value (or a smaller absolute value) indicates a better fit of the model. 
+
+```{r}
+selVars <- c()
+selPredVars <- c()
+minDrop <- 10
+
+for (v in earnsVars) {
+  pi <- paste('pred', v, sep = '_') 
+  devDrop <- 2 * (logLikelihood(validation[, outcome], validation[, pi]) - logNull)
+  if (devDrop >= minDrop) {
+    print(sprintf("%s, deviance reduction: %g", pi, devDrop))
+    selPredVars <- c(selPredVars, pi)
+    selVars <- c(selVars, v)
+  }
+}
+```
+By contrasting the predictive performance of each feature with the Null model, we can choose the variables that have a significant impact on the model. 
+
+The results shows that the "video.views" feature reduced the deviation by 501.462 compared to the Null model. Other features, such as "video_views_for_the_last_30_days" and "subscribers," also notably decreased the deviation. 
+
+This suggests that compare to the Null model, these features show a strong predictive capabilities in the model, and choose them as significantly influential variables.
+
+### 3.Multivariate models
+In this part, we trained a decision tree model using the following independent variables: "video.views", "video_views_for_the_last_30_days", "subscribers", "subscribers_for_last_30_days", "Population", and "Urban_population".  To evaluate the performance of this decision tree model.
+
+Additionally, we experimented with a second set of independent variables with "pred_" and use the same metrics to evaluate. Then compared the performances of the models trained with both sets of variables. 
+
+Lastly, we trained a logistic regression model, using the previously two sets of distinct independent variables for training and evaluation.
+
+### 3.1 Decision Tree with all variables.
+```{r}
+fv <- paste(outcome,' ~ ',paste(earnsVars, collapse="+"),sep='')
+
+tmodel<- rpart(fv,data=train)
+
+
+print(calcAUC(predict(tmodel, newdata=train), train[,outcome]))
+print(calcAUC(predict(tmodel, newdata=test), test[,outcome]))
+print(calcAUC(predict(tmodel, newdata=validation), validation[,outcome]))
+```
+Construct a decision tree model and assess its performance on the training set, test set, and validation set.
+
+The results indicate that the decision tree model has an AUC of 0.9872 on the training data, showing excellent performance. On the test data, the AUC was 0.9407, still reflecting a strong performance. With an AUC of 0.9567 on the validation data, the model also demonstrated a strong performance. 
+
+### 3.2 Model performance evaluation for independent variables-combination 1
+```{r}
+logLikelihood <- function(ytrue, ypred, epsilon=1e-6) {
+sum(ifelse(ytrue, log(ypred+epsilon), log(1-ypred+epsilon)), na.rm=T) }
+
+performanceMeasures <- function(ytrue, ypred, model.name = "model", threshold = 0.5) {
+  dev.norm <- -2 * logLikelihood(ytrue, ypred)/length(ypred)
+  
+  cmat <- table(actual = ytrue, predicted = ypred)
+  accuracy <- sum(diag(cmat)) / sum(cmat)
+  precision <- cmat[2, 2] / sum(cmat[, 2])
+  recall <- cmat[2, 2] / sum(cmat[2, ])
+  f1 <- 2 * precision * recall / (precision + recall)
+  data.frame(model = model.name, precision = precision,
+             recall = recall, f1 = f1, dev.norm = dev.norm)
+}
+
+panderOpt <- function(){
+  panderOptions("plain.ascii", TRUE)
+  panderOptions("keep.trailing.zeros", TRUE)
+  panderOptions("table.style", "simple")
+}
+```
+The results provide performance metrics in terms of accuracy, precision, recall, and F1 score.
+
+```{r}
+pretty_perf_table <- function(model, xtrain, ytrain, xval, yval, xtest, ytest, threshold=0.5) {
+
+  panderOpt()
+  perf_justify <- "lrrrr"
+
+  # Directly obtain the numeric vector of predictions
+  pred_train <- predict(model, newdata=xtrain)
+  pred_val <- predict(model, newdata=xval)
+  pred_test <- predict(model, newdata=xtest)
+
+  # Use the threshold to get the predicted classifications
+  trainperf_df <- performanceMeasures(ytrain, pred_train >= threshold, model.name="training")
+  valperf_df <-  performanceMeasures(yval, pred_val >= threshold, model.name="validation")
+  testperf_df <- performanceMeasures(ytest, pred_test >= threshold, model.name="test")
+
+  perftable <- rbind(trainperf_df, valperf_df, testperf_df)
+  pandoc.table(perftable, justify = perf_justify)
+}
+
+# Now you can call the function as you provided earlier
+pretty_perf_table(tmodel, 
+                  train[earnsVars], train[,outcome]==pos,
+                  validation[earnsVars], validation[,outcome]==pos,
+                  test[earnsVars], test[,outcome]==pos)
+
+```
+The results show that precision measures how many of the predicted positives are true positives. On the training set, the model's precision was 0.9887, suggesting that 98.87% of the samples predicted as positive were actually positive.
+
+Recall indicates how many of the actual positives were correctly predicted.  The recall for the validation set was 1.0000, which means the model successfully identified all the positive samples.
+
+The F1 score is the harmonic mean of precision and recall. With an F1 score of 0.9662 on the test set, this represents a high value, indicating that both precision and recall of the model are relatively high on the test data.
+
+dev.norm shows the goodness of fit for the model. A lower value indicates a better fit of the model.
+
+Overall, this model demonstrates a good performance across all three datasets.
+
+```{r}
+# compare the Log Likelihood for the Null model and Decision Tree model. 
+logNull <- logLikelihood(train[,outcome], sum(train[,outcome]==pos)/nrow(train))
+print(paste('Null Model Log Likelihood:', logNull))
+```
+When predicting the training data using the Null Model, the Log Likelihood is -283.9316.
+
+```{r}
+log_tmodel <- logLikelihood(train[,outcome]==pos, predict(tmodel, newdata=train))
+print(paste('Decision Tree Model Log Likelihood:',log_tmodel))
+```
+The log-likelihood value of the decision tree model is -21.71.
+
+```{r}
+plot_roc <- function(predcol1, outcol1, predcol2, outcol2){
+  # Calculate ROC for both training and validation data
+  roc_train <- rocit(score=predcol1, class=outcol1==pos)
+  roc_val <- rocit(score=predcol2, class=outcol2==pos)
+  
+  # Plot ROC for training data
+  plot(roc_train, col="blue", lwd=3, legend=FALSE, YIndex=FALSE, values=TRUE, asp=1, main="ROC Curve")
+  
+  # Add ROC for validation data
+  lines(roc_val$TPR ~ roc_val$FPR, col="red", lwd=3)
+  
+  # Add legend to differentiate between the curves
+  legend("bottomright", col=c("blue", "red"), legend=c("Training Data", "Validation Data"), lwd=1.5, cex=0.8, inset=c(0.1, 0.1))
+}
+
+# Now, use this function to plot the ROC curves
+pred_train_roc <- predict(tmodel, newdata=train)
+pred_val_roc <- predict(tmodel, newdata=validation)
+
+p1 <- plot_roc(pred_train_roc, train[[outcome]], pred_val_roc, validation[[outcome]])
+p1
+```
+Plot the decision tree model for the first set of independent variables.
+
+Based on the results, the closer the curve is to the top left corner, the better the performance of the model. The blue line represents the ROC curve using the training data, while the red line represents the ROC curve using the validation data. Both lines exhibit strong performance.
+
+### 3.3 Decision Tree with reprocessed variables.
+Rather than using all of the original variables, we can use the "pred_" variables that we obtained from our investigation
+using the single variable models.（Lecture:Model and Feature Selection）
+
+```{r}
+tVars <- paste('pred_', earnsVars, sep='')
+
+fv2 <- paste(outcome, ' ~ ', paste(tVars, collapse = '+'), sep = '')
+
+tmodel2 <- rpart(fv2, data=train)
+
+print(calcAUC(predict(tmodel2, newdata=train), train[,outcome]))
+print(calcAUC(predict(tmodel2, newdata=test), test[,outcome]))
+print(calcAUC(predict(tmodel2, newdata=validation), validation[,outcome]))
+```
+For the second set of independent variables, compared to the first set, there wasn't an improvement in the AUC and overall model performance but there was a decline. In the train dataset, the AUC decreased by 0.15. In the test dataset, the AUC decreased by 0.162 and in the validation dataset, the AUC decreased by 0.083.
+
+```{r}
+pretty_perf_table(tmodel2, 
+                  train[tVars], train[,outcome]==pos,
+                  validation[tVars], validation[,outcome]==pos,
+                  test[tVars], test[,outcome]==pos)
+```
+We also printed out the performance of the "tmodel2" with the second set of independent variables. The model achieved a recall of 1 on all datasets which successfully predicted all positive variables. However, compare to the first set of independent variables, there was a decline in precision, F1 score, and dev.norm values.
+
+A possible reason could be that if the original predictive variable model was overfitting on the training data, then these predictions might not be robust, and will the performance of the decision tree model.
+
+```{r}
+plot_roc2 <- function(predcol1, outcol1, predcol2, outcol2){
+  # Calculate ROC for both training and validation data
+  roc_train <- rocit(score=predcol1, class=outcol1==pos)
+  roc_val <- rocit(score=predcol2, class=outcol2==pos)
+  
+  # Plot ROC for training data
+  plot(roc_train, col="darkgreen", lwd=3, legend=FALSE, YIndex=FALSE, values=TRUE, asp=1, main="ROC Curve")
+  
+  # Add ROC for validation data
+  lines(roc_val$TPR ~ roc_val$FPR, col="orange", lwd=3)
+  
+  # Add legend to differentiate between the curves
+  legend("bottomright", col=c("darkgreen", "orange"), legend=c("Training Data", "Validation Data"), lwd=1.5, cex=0.8, inset=c(0.1, 0.1))
+}
+
+# Now, use this function to plot the ROC curves
+pred_train_roc <- predict(tmodel2, newdata=train)
+pred_val_roc <- predict(tmodel2, newdata=validation)
+
+p2 <- plot_roc2(pred_train_roc, train[[outcome]], pred_val_roc, validation[[outcome]])
+p2
+```
+We can see from the plot that the result is clearly not as good as the first model.
+
+### 3.4 Logistic regression
+The reason we choose logistic regression is due to its strong interpretability. And it is suitable for binary classification problems and can also handle numerical data effectively.
+
+```{r}
+median_value <- median(df_to_classification$subscribers_for_last_30_days, na.rm = TRUE)
+
+
+train$subscribers_for_last_30_days[is.na(train$subscribers_for_last_30_days)] <- median_value
+test$subscribers_for_last_30_days[is.na(test$subscribers_for_last_30_days)] <- median_value
+validation$subscribers_for_last_30_days[is.na(validation$subscribers_for_last_30_days)] <- median_value
+
+formula <- as.formula(paste("earnings ~", paste(earnsVars, collapse = " + ")))
+suppressWarnings({
+  model3 <- glm(formula, data=train, family=binomial(link="logit"))
+})
+
+
+print(calcAUC(predict(model3, newdata=train), train[,outcome]))
+print(calcAUC(predict(model3, newdata=test), test[,outcome]))
+print(calcAUC(predict(model3, newdata=validation), validation[,outcome]))
+```
+First, we choose the first dataset. We can see from the results, logistic regression is sensitive to missing values. Because it is a probabilistic model it will encounter errors and fail to run if the independent variable data contains NA (missing) values. 
+
+However, this issue does not appear in the decision tree model, indicating that the decision tree model have a certain robustness to missing values. This is one of the advantages of decision trees. Because the proportion of missing values in this dataset is roughly around 1/4, when new data is imported, there's a chance it might also contain a significant number of missing values. In such case, decision tree models would perform better and demonstrate strong applicability.
+
+```{r}
+train$pred <- predict(model3, newdata=train, type="response")
+test$pred <- predict(model3, newdata=test, type="response")
+
+ggplot(train, aes(x=pred, fill=earnings, group=earnings)) + geom_density(alpha=0.5) +
+  theme(text=element_text(size=20))
+```
+```{r}
+pretty_perf_table(model3, 
+                  train[earnsVars], train[,outcome]==pos,
+                  validation[earnsVars], validation[,outcome]==pos,
+                  test[earnsVars], test[,outcome]==pos)
+```
+```{r}
+pred_train_roc2 <- predict(model3, newdata=train)
+pred_val_roc2 <- predict(model3, newdata=validation)
+
+p3 <- plot_roc(pred_train_roc2, train[[outcome]], pred_val_roc2, validation[[outcome]])
+p3
+```
+The two distributions have being well separated indicates that the model could build a classifier that simultaneously achieves good recall and good precision.
+
+```{r}
+formula2 <- as.formula(paste("earnings ~", paste(tVars, collapse = " + ")))
+suppressWarnings({
+  model3_2 <- glm(formula2, data=train, family=binomial(link="logit"))
+  
+  pred_train_roc2 <- predict(model3_2, newdata=train)
+  pred_val_roc2 <- predict(model3_2, newdata=validation)
+
+  p4 <- plot_roc2(pred_train_roc2, train[[outcome]], pred_val_roc2, validation[[outcome]])
+  p4
+})
+
+```
+Then use the reprocessed data, from the result we can see that the performance of the second set of data is inferior compared to the first. A potential reason could be that the second set of data is smaller in than the first dataset. The model might be more susceptible to overfitting, and lead to a worse performance on new data.
+
+### 3.5 Conclusion
+
+In summary, after the modeling process, the best-performing combination is the decision tree model and use all variables. This combination show a robustness and superior performance across the datasets. 
+
+During the modeling process, we used the AUC to describe the model's ability to distinguish between the positive and negative classes. The tmodel has a good performance across all datasets, shows its superior classification capability.
+
+Next, we use Performance Metrics to ensure the Precision, Recall, and the F1 Score (the harmonic mean of precision and recall). Similarly, the tmodel performed well across all evaluation metrics, showcasing its good performance. 
+
+We also use the ROC Curve to illustrate the relationship between the True Positive Rate and the False Positive Rate at various thresholds. The model displayed a curve close to the top left corner, indicating excellent performance.
+
+Of course, we also have some measures for future improvements. For example, we can further explore other models to see which performs best on this dataset. Or use cross-validation to assess the performance of the model and so on. 
+
+Additionally, as mentioned earlier, there's a possibility that the model is overfitted. Therefore, we need to be careful and we could simplify the model to address this issue.
+
+In conclusion, our model is simple and efficient. It has a quick training and prediction speeds. It can interprets and integrates crucial factors related to YouTubers, making its predictions more accurate and comprehensive.
+
+### 4.Clustering
+
+Since clustering is unsupervised learning, its main difference from supervised learning, such as classifiers, is that clustering algorithms do not have a predetermined dependent variable. It places more emphasis on examining the inherent structure and patterns within the data. In this section, we will use clustering to explore the demographic profiles of different channel types based on city population, channel subscriptions, and the Gross Tertiary Education Enrollment (GTEE) rate of countries.
+
+```{r}
+df_sum <- gy_data %>% dplyr::select("Urban_population", "subscribers", "Gross.tertiary.education.enrollment....", "channel_type")
+names(df_sum)[names(df_sum) == "Gross.tertiary.education.enrollment...."] <- "GTEE"
+df_sum <- df_sum %>% drop_na() 
+summary(df_sum)
+```
+It's worth noting that in some countries like Australia (or Finland), we may find that their GTEE is greater than 100%. This could be due to additional enrollment opportunities provided by local universities for international students (https://knoema.com/atlas/Australia/topics/Education/Tertiary-Education/Gross-enrolment-ratio-in-tertiary-education).
+
+Next, we will perform a 'group by' operation on channel types and prepare the data for the subsequent hierarchical clustering.
+```{r}
+df_sum <- df_sum %>%
+  group_by(channel_type) %>%
+  summarise(
+    mean_urbanpop = mean(Urban_population),
+    mean_subs = mean(subscribers),
+    mean_gtee = mean(GTEE)
+  )
+summary(df_sum)
+```
+First, we will use a dendrogram chart for an initial exploration of clustering. Based on the dendrogram chart, we will use 'rect.hclust' to present clusters more clearly, temporarily setting k (the number of clusters) to 4. This choice is because there are a total of 14 different types of 'channel_type,' and we want to avoid overly fragmented clusters that may reduce interpretability.
+
+```{r}
+df_to_cluster<- df_sum %>% dplyr::select(contains("mean"))
+d <- dist(df_to_cluster, method="euclidean")
+pfit <- hclust(d, method="ward.D2")
+
+plot(pfit, cex=0.6,labels=df_sum$channel_type,main="Dendrogram")
+rect.hclust(pfit, k=4) # k=5 means we want rectangles to be put around 5 clusters
+```
+
+Since we are currently only making a preliminary attempt at hierarchical clustering, we are not going into a detailed interpretation of the results. Next, we will examine which clusters are relatively stable. Under the condition of k=4, we can observe that clusters 1, 3, and 4 are relatively stable, but the level of certainty remains low. Cluster 2 is unstable.
+```{r}
+library(fpc)
+kbest.p <- 4
+cboot.hclust <- clusterboot(df_to_cluster, clustermethod=hclustCBI,
+method="ward.D2", k=kbest.p)
+summary(cboot.hclust$result)
+groups.cboot <- as.factor(cboot.hclust$result$partition)
+values<- 1-cboot.hclust$bootbrd/100
+values
+```
+So, it's evident that there is room for improvement in the choice of k. Next, we will determine the most suitable k value by calculating the Calinski-Harabasz index (CH index) and WSS.
+
+```{r}
+# Function to return the squared Euclidean distance of two given points x and y
+sqr_euDist <- function(x, y) {
+sum((x - y)^2)
+}
+# Function to calculate WSS of a cluster, represented as a n-by-d matrix
+# (where n and d are the numbers of rows and columns of the matrix)
+# which contains only points of the cluster.
+wss <- function(clustermat) {
+c0 <- colMeans(clustermat)
+sum(apply( clustermat, 1, FUN=function(row) {sqr_euDist(row, c0)} ))
+}
+# Function to calculate the total WSS. Argument `scaled_df`: data frame
+# with normalised numerical columns. Argument `labels`: vector containing
+# the cluster ID (starting at 1) for each row of the data frame.
+wss_total <- function(scaled_df, labels) {
+wss.sum <- 0
+k <- length(unique(labels))
+for (i in 1:k)
+wss.sum <- wss.sum + wss(subset(scaled_df, labels == i))
+wss.sum
+}
+
+# Function to calculate total sum of squared (TSS) distance of data
+# points about the (global) mean. This is the same as WSS when the
+# number of clusters (k) is 1.
+tss <- function(scaled_df) {
+wss(scaled_df)
+}
+```
+```{r}
+# Function to return the CH indices computed using hierarchical
+# clustering (function `hclust`) or k-means clustering (`kmeans`)
+# for a vector of k values ranging from 1 to kmax.
+CH_index <- function(scaled_df, kmax, method="kmeans") {
+if (!(method %in% c("kmeans", "hclust")))
+stop("method must be one of c('kmeans', 'hclust')")
+npts <- nrow(scaled_df)
+wss.value <- numeric(kmax) # create a vector of numeric type
+# wss.value[1] stores the WSS value for k=1 (when all the
+# data points form 1 large cluster).
+wss.value[1] <- wss(scaled_df)
+if (method == "kmeans") {
+# kmeans
+for (k in 2:kmax) {
+  clustering <- kmeans(df_to_cluster, k, nstart=7, iter.max=100)
+  wss.value[k] <- clustering$tot.withinss
+  }
+} else {
+# hclust
+d <- dist(df_to_cluster, method="euclidean")
+pfit <- hclust(d, method="ward.D2")
+for (k in 2:kmax) {
+  labels <- cutree(pfit, k=k)
+  wss.value[k] <- wss_total(df_to_cluster, labels)
+  }
+}
+
+bss.value <- tss(df_to_cluster) - wss.value 
+B <- bss.value / (0:(kmax-1)) 
+W <- wss.value / (npts - 1:kmax) 
+data.frame(k = 1:kmax, CH_index = B/W, WSS = wss.value)
+}
+```
+```{r}
+# calculate the CH criterion
+crit.df <- CH_index(df_to_cluster, 7, method="hclust")
+fig1 <- ggplot(crit.df, aes(x=k, y=CH_index)) +
+geom_point() + geom_line(colour="red") +
+scale_x_continuous(breaks=1:10, labels=1:10) +
+labs(y="CH index") + theme(text=element_text(size=20))
+fig2 <- ggplot(crit.df, aes(x=k, y=WSS), color="blue") +
+geom_point() + geom_line(colour="blue") +
+scale_x_continuous(breaks=1:10, labels=1:10) +
+theme(text=element_text(size=20))
+grid.arrange(fig1, fig2, nrow=1)
+```
+Usually, we determine the optimal k value based on the elbow point in the graph. In this case, the CH index graph has its highest value at k=6. However, selecting the maximum value is not the sole criterion for choosing the k value. We want k to optimize the stability of clusters and other performance indicators, while maintaining interpretability. Therefore, we choose k=5 because it corresponds to a relatively high value in the CH index graph and still shows significant improvement between 5 and 6. Additionally, the corresponding value in the WSS graph is relatively low, and there is still a decrease between 5 and 6.
+
+```{r}
+plot(pfit, labels=df_sum$channel_type, main="Cluster Dendrogram for injured people's work experience in different occupations")
+rect.hclust(pfit, k=6)
+```
+By increasing the k value to 5 and performing stability assessment again, we can see that Cluster 1 has a value greater than 0.8, indicating relatively high stability with significant improvement. On the other hand, Cluster 2 and Cluster 5 have low certainty, and Clusters 3 and 4 are unstable. Compared to the initial attempt, a k value of 5 has provided more convincing results for at least one cluster.
+
+```{r}
+print_clusters <- function(df, groups, cols_to_print) {
+  Ngroups <- max(groups)
+  for (i in 1:Ngroups) {
+    print(paste("cluster", i))
+    print(df[groups == i, cols_to_print])
+  }
+}
+
+groups <- cutree(pfit, k=4)
+cols_to_print <- c("channel_type","mean_urbanpop", "mean_subs", "mean_gtee")
+print_clusters(df_sum, groups, cols_to_print)
+```
+We can observe the following characteristics for these clusters:
+
+For channels with "Education" and "Tech" channel types:
+
+These channels tend to belong to countries with a relatively higher urban population.
+They have fewer subscribers compared to other channel types.
+The overall Gross Tertiary Enrollment (GTEE) rate in the country is relatively lower.
+Countries with high GTEE and moderate urban population levels may be more inclined to focus on "Animals," "Sports," or other niche channel types.
+
+In countries with lower GTEE rates, people may prefer "Comedy," "Film," and other channel types.
+
+Countries with smaller urban populations are likely to be interested in "Autos," "Entertainment," and "Music" channels.
+
+These observations provide insights into the viewing preferences and channel characteristics associated with different channel types and their respective countries.
+```{r}
+princ <- prcomp(df_to_cluster) # Calculate the principal components of df_to_cluster
+nComp <- 2 # focus on the first two principal components
+# project df_to_cluster onto the first 2 principal components to form a new
+# 2-column data frame.
+# Assuming groups is a factor
+project2D <- as.data.frame(predict(princ, newdata=df_to_cluster)[,1:nComp])
+# combine with `groups` and df$Country to form a 4-column data frame
+hclust.project2D <- cbind(project2D, cluster=as.factor(groups))
+head(hclust.project2D)
+```
+```{r}
+library('grDevices')
+library('ggplot2')
+find_convex_hull <- function(proj2Ddf, groups) {
+  do.call(rbind,
+    lapply(unique(groups),
+    FUN = function(c) {
+    f <- subset(proj2Ddf, cluster==c);
+    f[chull(f),]
+        }
+      )
+  )
+}
+hclust.hull <- find_convex_hull(hclust.project2D, groups)
+
+ggplot(hclust.project2D, aes(x=PC1, y=PC2)) +
+geom_point(aes(shape=cluster, color=cluster)) +
+
+geom_polygon(data=hclust.hull, aes(group=cluster, fill=as.factor(cluster)),
+alpha=0.4, linetype=0) + theme(text=element_text(size=20))
+```
+
+### 4.1 Apply K-means Clustering
+
+First, the algorithm with k=5 is visualized to facilitate comparison. Simultaneously, Principal Component Analysis (PCA) is applied to reduce the high-dimensional data to two dimensions.
+```{r}
+kbest.p<- 5
+km.clusters<- kmeans(df_to_cluster,kbest.p,nstart = 100,iter.max = 100)
+km.clusters$centers
+```
+```{r}
+km.clusters$size
+```
+```{r}
+groups<- km.clusters$cluster
+print_clusters(df_sum,groups,"channel_type")
+```
+
+Similarly, we use a similar method to find the appropriate k value, but this time we use the CH index + ASW method.
+
+```{r}
+kmClustering.ch <- kmeansruns(df_to_cluster, krange=1:7, criterion="ch")
+kmClustering.asw <- kmeansruns(df_to_cluster, krange=1:7, criterion="asw")
+
+kmCritframe <- data.frame(k=1:7, ch=kmClustering.ch$crit,
+asw=kmClustering.asw$crit)
+fig1 <- ggplot(kmCritframe, aes(x=k, y=ch)) +
+geom_point() + geom_line(colour="red") +
+scale_x_continuous(breaks=1:7, labels=1:7) +
+labs(y="CH index") + theme(text=element_text(size=20))
+fig2 <- ggplot(kmCritframe, aes(x=k, y=asw)) +
+geom_point() + geom_line(colour="blue") +
+scale_x_continuous(breaks=1:7, labels=1:7) +
+labs(y="ASW") + theme(text=element_text(size=20))
+grid.arrange(fig1, fig2, nrow=1)
+```
+
+Due to the possible influence of some outliers in the dataset, the CH index and ASW may not simultaneously reach their ideal values at the same k value. For instance, the maximum points may not coincide. This could be improved in future work. In this analysis, we choose k=2, which corresponds to the highest ASW point and the first elbow point in the CH index.
+
+```{r}
+fig <- c()
+kvalues <- seq(2,5)
+for (k in kvalues) {
+groups <- kmeans(df_to_cluster, k, nstart=100, iter.max=100)$cluster
+kmclust.project2D <- cbind(project2D, cluster=as.factor(groups),
+country=df_sum$channel_type)
+kmclust.hull <- find_convex_hull(kmclust.project2D, groups)
+assign(paste0("fig", k),
+ggplot(kmclust.project2D, aes(x=PC1, y=PC2)) +
+geom_point(aes(shape=cluster, color=cluster)) +
+geom_polygon(data=kmclust.hull, aes(group=cluster, fill=cluster),
+alpha=0.4, linetype=0) +
+labs(title = sprintf("k = %d", k)) +
+theme(legend.position="none", text=element_text(size=20))
+)
+}
+grid.arrange(fig2, fig3, fig4, fig5, nrow=2)
+```
+
+In comparison with different values of k, we observed that when k is set to 2 or 3, the clusters are more similar and offer relatively strong interpretability. However, as k increases (e.g., when k is set to 5), the interpretability decreases, but we can identify more potential patterns in the visualizations. These patterns may reveal more possibilities as the scope of future datasets expands. Overall, we have observed some meaningful conclusions, such as the followers of sports and animal channels being associated with lower urban population and higher overall enrollment rates in their respective countries. Nevertheless, we must acknowledge that there is room for improvement in both the dataset and data processing. For instance, expanding the dataset to include the top 10,000 ranked YouTubers or incorporating additional available features could enhance the results.
+
+
